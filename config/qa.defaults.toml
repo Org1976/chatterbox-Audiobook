@@ -1,0 +1,26 @@
+[qa.thresholds]
+min_duration = 0.35
+max_duration = 120.0
+min_rms_db = -50.0
+max_rms_db = -5.0
+min_peak_db = -6.0
+max_peak_db = 0.0
+max_dynamic_range_db = 45.0
+min_zero_crossing_rate = 0.01
+max_zero_crossing_rate = 0.20
+
+[qa.asr]
+provider = "whisper"
+model_size = "base.en"
+device = "cpu"
+compute_type = "int8"
+
+[qa.retry]
+generation_max_attempts = 3
+validation_max_attempts = 2
+cooldown_seconds = 1.0
+
+[qa.local]
+validator_model_dir = "models/qa/validator"
+asr_model_dir = "models/qa/whisper"
+alignment_model_dir = "models/qa/alignment"
