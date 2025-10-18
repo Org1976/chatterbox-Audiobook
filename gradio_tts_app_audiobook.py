@@ -15,6 +15,8 @@ from typing import List
 import warnings
 warnings.filterwarnings("ignore")
 
+from src.audiobook.validator import validate_and_autofix_project
+
 # Configure tqdm for better progress bar behavior
 import sys
 from contextlib import redirect_stdout, redirect_stderr
@@ -746,11 +748,17 @@ def create_audiobook(
     if not voice_config['audio_file']:
         return None, f"❌ No audio file found for voice '{voice_config['display_name']}'"
 
+    voice_config.setdefault('voice_name', selected_voice)
+    default_pause_duration = 0.1
+    validation_threshold = voice_config.get('validation_wer_threshold', 0.25)
+
     # Import pause processing functions
     from src.audiobook.processing import chunk_text_with_line_break_priority, create_silence_audio
 
     # Chunk text with line breaks taking priority over sentence breaks
-    chunks_with_pauses, total_pause_duration = chunk_text_with_line_break_priority(text_content, max_words=50, pause_duration=0.1)
+    chunks_with_pauses, total_pause_duration = chunk_text_with_line_break_priority(
+        text_content, max_words=50, pause_duration=default_pause_duration
+    )
     
     # Extract just the text parts for processing
     chunks = [chunk_data['text'] for chunk_data in chunks_with_pauses]
@@ -868,9 +876,15 @@ def create_audiobook(
                 'voice_name': selected_voice,
                 'display_name': voice_config['display_name'],
                 'audio_file': voice_config['audio_file'],
+                'audio_prompt_path': voice_config['audio_file'],
                 'exaggeration': voice_config['exaggeration'],
                 'cfg_weight': voice_config['cfg_weight'],
-                'temperature': voice_config['temperature']
+                'temperature': voice_config['temperature'],
+                'min_p': voice_config.get('min_p', 0.05),
+                'top_p': voice_config.get('top_p', 1.0),
+                'repetition_penalty': voice_config.get('repetition_penalty', 1.2),
+                'pause_duration': default_pause_duration,
+                'validation_wer_threshold': validation_threshold,
             }
             save_project_metadata(
                 project_dir=project_dir,
@@ -889,6 +903,40 @@ def create_audiobook(
     
     pause_info = f" (including {total_pause_duration:.1f}s of pauses)" if total_pause_duration > 0 else ""
     success_msg = f"✅ Audiobook created successfully!\n🎭 Voice: {voice_config['display_name']}\n📊 {total_words:,} words in {total_chunks} chunks\n⏱️ Duration: ~{duration_minutes} minutes{pause_info}\n📁 Saved to: {project_dir}\n🎵 Files: {len(audio_chunks)} audio chunks\n💾 Metadata saved for regeneration"
+
+    qa_summary = None
+    try:
+        qa_summary = validate_and_autofix_project(
+            project_dir,
+            model=model,
+            voice_config=voice_config,
+            audio_prompt_path=voice_config.get('audio_file'),
+            pause_duration=default_pause_duration,
+            thresholds={'wer': validation_threshold},
+            voice_library_path=voice_library_path,
+        )
+    except Exception as qa_error:
+        print(f"⚠️ Validation skipped for {project_name}: {qa_error}")
+
+    if qa_summary:
+        threshold_value = qa_summary.get('thresholds', {}).get('wer', validation_threshold)
+        validated_chunks = qa_summary.get('validated_chunks', 0)
+        qa_path = Path(project_dir) / "qa_summary.json"
+        if validated_chunks:
+            avg_wer = qa_summary.get('average_wer')
+            if avg_wer is not None:
+                success_msg += (
+                    f"\n🧪 QA: {qa_summary.get('passed_chunks', 0)}/{validated_chunks} chunks "
+                    f"≤{threshold_value:.0%} WER (avg {avg_wer:.2%})"
+                )
+            else:
+                success_msg += (
+                    f"\n🧪 QA: {validated_chunks} chunks validated at ≤{threshold_value:.0%} WER"
+                )
+            success_msg += f"\n📄 QA report saved: {qa_path.name}"
+        else:
+            success_msg += "\n🧪 QA: No chunks available for validation"
+
     return (sample_rate, combined_audio), success_msg
 
 def load_voice_for_tts(voice_library_path, voice_name):
