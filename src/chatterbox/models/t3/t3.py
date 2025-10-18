@@ -4,6 +4,7 @@ import logging
 from typing import Union, Optional, List
 
 from tqdm import tqdm
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
@@ -68,7 +69,6 @@ class T3(nn.Module):
         # logit projection
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False)
-        self.compiled = False
 
     @property
     def device(self):
@@ -226,6 +226,7 @@ class T3(nn.Module):
         min_p=0.05,
         top_p=1.0,
         cfg_weight=0,
+        enable_alignment_analysis: bool = False,
     ):
         """
         Args:
@@ -254,24 +255,31 @@ class T3(nn.Module):
 
         # TODO? synchronize the expensive compile function
         # with self.compile_lock:
+        alignment_stream_analyzer = None
         if not self.compiled:
-            alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                self.tfmr,
-                None,
-                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                alignment_layer_idx=9, # TODO: hparam or something?
-                eos_idx=self.hp.stop_speech_token,
-            )
-            patched_model = T3HuggingfaceBackend(
+            self.patched_model = T3HuggingfaceBackend(
                 config=self.cfg,
                 llama=self.tfmr,
                 speech_enc=self.speech_emb,
                 speech_head=self.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
+                alignment_stream_analyzer=None,
             )
-            self.patched_model = patched_model
             self.compiled = True
 
+        # Enable per-call alignment analysis only when requested
+        if enable_alignment_analysis:
+            alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                self.tfmr,
+                None,
+                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                alignment_layer_idx=9,  # TODO: hparam or something?
+                eos_idx=self.hp.stop_speech_token,
+            )
+            self.patched_model.alignment_stream_analyzer = alignment_stream_analyzer
+        else:
+            # Ensure analyzer is disabled when not needed
+            self.patched_model.alignment_stream_analyzer = None
+            
         # # Run normal generate method, which calls our custom extended methods
         # return self.patched_model.generate(
         #     inputs=initial_speech_tokens,
@@ -301,9 +309,14 @@ class T3(nn.Module):
         # Combine condition and BOS token for the initial input
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
-        # Track generated token ids; start with the BOS token.
-        generated_ids = bos_token.clone()
-        predicted = []  # To store the predicted tokens
+        # Preallocate token buffer on device to avoid per‑step tensor cat and Python list growth
+        max_steps = int(max_new_tokens)
+        token_buffer = torch.empty((1, max_steps + 1), dtype=torch.long, device=device)
+        token_buffer[:, 0] = bos_token
+        generated_len = 0  # number of generated tokens (excludes BOS)
+
+        # A view of the currently generated sequence including BOS for processors
+        generated_ids = token_buffer[:, :1]
 
         # Instantiate the logits processors.
         min_p_warper = MinPLogitsWarper(min_p=min_p)
@@ -315,8 +328,8 @@ class T3(nn.Module):
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
-            output_hidden_states=True,
+            output_attentions=False,
+            output_hidden_states=False,
             return_dict=True,
         )
         # Initialize kv_cache with the full context.
@@ -345,8 +358,10 @@ class T3(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
-            predicted.append(next_token)
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            # Append into preallocated buffer without new allocations
+            token_buffer[:, generated_len + 1] = next_token.view(1, 1)
+            generated_len += 1
+            generated_ids = token_buffer[:, :generated_len + 1]
 
             # Check for EOS token.
             if next_token.view(-1) == self.hp.stop_speech_token:
@@ -363,13 +378,20 @@ class T3(nn.Module):
             output = self.patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
-                output_hidden_states=True,
+                output_attentions=False,
+                output_hidden_states=False,
                 return_dict=True,
             )
             # Update the kv_cache.
             past = output.past_key_values
 
         # Concatenate all predicted tokens along the sequence dimension.
-        predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
+        predicted_tokens = token_buffer[:, 1:generated_len + 1]  # shape: (B, num_tokens)
+        # Clean up alignment hook to avoid accumulation across generations
+        if alignment_stream_analyzer is not None:
+            try:
+                alignment_stream_analyzer.close()
+            except Exception:
+                pass
         return predicted_tokens
+
