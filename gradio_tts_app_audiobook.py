@@ -4463,6 +4463,10 @@ def create_audiobook_with_original_voice_metadata(
             }
             chunk_info_list.append(chunk_info)
             
+            # Clear GPU memory after each chunk to prevent fragmentation
+            del audio_data
+            clear_gpu_memory()
+            
         except Exception as e:
             import traceback
             traceback.print_exc()
