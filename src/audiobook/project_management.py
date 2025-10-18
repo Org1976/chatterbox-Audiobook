@@ -8,19 +8,75 @@ import os
 import json
 import shutil
 import time
+import wave
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
+
+import numpy as np
 
 from .text_processing import chunk_text_by_sentences, parse_multi_voice_text, chunk_multi_voice_segments
 from .audio_processing import save_audio_chunks, auto_remove_silence, normalize_audio_levels, analyze_audio_quality
 from .voice_management import load_voice_for_tts, get_voice_config
 from .models import generate_with_retry, load_model_cpu
+from .qa import (
+    ensure_project_qa_file,
+    load_project_qa_config,
+    get_retry_settings,
+    validate_audio_file,
+)
 
 
 # Constants
 MAX_CHUNKS_FOR_INTERFACE = 100
 MAX_CHUNKS_FOR_AUTO_SAVE = 100
+
+
+def _sanitize_project_name(project_name: str) -> str:
+    """Create a filesystem-safe project directory name."""
+    safe_name = "".join(c for c in project_name if c.isalnum() or c in (" ", "-", "_")).strip()
+    return safe_name.replace(" ", "_")
+
+
+def _get_project_dir(project_name: str) -> Path:
+    """Resolve the project directory for a given project name."""
+    return Path("audiobook_projects") / _sanitize_project_name(project_name)
+
+
+def _audio_tensor_to_numpy(audio_obj: Any) -> np.ndarray:
+    """Convert model output audio into a 1-D numpy array."""
+    if audio_obj is None:
+        return np.zeros(0, dtype=np.float32)
+
+    data = audio_obj
+    if hasattr(data, "detach"):
+        data = data.detach()
+    if hasattr(data, "cpu"):
+        data = data.cpu()
+    if hasattr(data, "squeeze"):
+        data = data.squeeze(0)
+    if hasattr(data, "numpy"):
+        data = data.numpy()
+
+    array = np.asarray(data, dtype=np.float32)
+    if array.ndim > 1:
+        array = array.reshape(-1)
+    return array
+
+
+def _write_temp_wav(path: Path, audio_data: np.ndarray, sample_rate: int) -> None:
+    """Persist audio data to a WAV file in int16 format."""
+    audio = np.asarray(audio_data, dtype=np.float32)
+    if audio.size == 0:
+        audio = np.zeros(1, dtype=np.float32)
+
+    audio = np.clip(audio, -1.0, 1.0)
+
+    with wave.open(str(path), 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes((audio * 32767).astype(np.int16).tobytes())
 
 
 def save_project_metadata(
@@ -245,10 +301,10 @@ def create_audiobook(
     chunks = chunk_text_by_sentences(text_content, max_words=50)
     
     # Create project directory
-    safe_project_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).strip()
-    safe_project_name = safe_project_name.replace(' ', '_')
-    project_dir = os.path.join("audiobook_projects", safe_project_name)
+    safe_project_name = _sanitize_project_name(project_name)
+    project_dir = _get_project_dir(project_name)
     os.makedirs(project_dir, exist_ok=True)
+    ensure_project_qa_file(project_dir)
     
     # Save project metadata
     voice_info = {
@@ -300,10 +356,14 @@ def create_audiobook(
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
         
-        return f"✅ Audiobook '{project_name}' created successfully! Generated {len(chunks)} audio chunks.", generated_files, project_dir
+        return (
+            f"✅ Audiobook '{project_name}' created successfully! Generated {len(chunks)} audio chunks.",
+            generated_files,
+            str(project_dir),
+        )
         
     except Exception as e:
-        return f"❌ Error creating audiobook: {str(e)}", generated_files, project_dir
+        return f"❌ Error creating audiobook: {str(e)}", generated_files, str(project_dir)
 
 
 def create_multi_voice_audiobook_with_assignments(
@@ -337,10 +397,10 @@ def create_multi_voice_audiobook_with_assignments(
     chunked_segments = chunk_multi_voice_segments(segments, max_words=50)
     
     # Create project directory
-    safe_project_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).strip()
-    safe_project_name = safe_project_name.replace(' ', '_')
-    project_dir = os.path.join("audiobook_projects", safe_project_name)
+    safe_project_name = _sanitize_project_name(project_name)
+    project_dir = _get_project_dir(project_name)
     os.makedirs(project_dir, exist_ok=True)
+    ensure_project_qa_file(project_dir)
     
     # Save project metadata
     voice_info = {
@@ -408,10 +468,18 @@ def create_multi_voice_audiobook_with_assignments(
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
         
-        return f"✅ Multi-voice audiobook '{project_name}' created successfully! Generated {len(chunked_segments)} audio segments.", generated_files, project_dir
+        return (
+            f"✅ Multi-voice audiobook '{project_name}' created successfully! Generated {len(chunked_segments)} audio segments.",
+            generated_files,
+            str(project_dir),
+        )
         
     except Exception as e:
-        return f"❌ Error creating multi-voice audiobook: {str(e)}", generated_files, project_dir
+        return (
+            f"❌ Error creating multi-voice audiobook: {str(e)}",
+            generated_files,
+            str(project_dir),
+        )
 
 
 def cleanup_project_temp_files(project_name: str) -> str:
@@ -604,7 +672,7 @@ def analyze_project_audio_quality(project_name: str) -> str:
 
 def get_project_chunks(project_name: str) -> List[Dict[str, Any]]:
     """Get list of audio chunks for a project.
-    
+
     Args:
         project_name: Name of the project
         
@@ -653,4 +721,176 @@ def get_project_chunks(project_name: str) -> List[Dict[str, Any]]:
         
     except Exception as e:
         print(f"Error getting project chunks: {e}")
-        return [] 
+        return []
+
+
+def regenerate_chunk_with_validation(
+    model: Any,
+    project_name: str,
+    chunk_number: int,
+    voice_library_path: str,
+    custom_text: Optional[str] = None
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Regenerate a chunk and validate it against QA thresholds.
+
+    Args:
+        model: TTS model instance to use for regeneration.
+        project_name: Name of the project containing the chunk.
+        chunk_number: 1-based chunk index to regenerate.
+        voice_library_path: Path to the voice library for fallback loading.
+        custom_text: Optional override text for the chunk.
+
+    Returns:
+        Tuple of (path to regenerated temp file or None, validation details).
+    """
+    if not project_name:
+        return None, {"passed": False, "issues": ["No project specified."]}
+
+    project_dir = _get_project_dir(project_name)
+    if not project_dir.exists():
+        return None, {
+            "passed": False,
+            "issues": [f"Project directory not found: {project_dir}"]
+        }
+
+    ensure_project_qa_file(project_dir)
+    qa_config = load_project_qa_config(project_dir)
+    retry_settings = get_retry_settings(qa_config)
+
+    metadata = load_project_metadata(str(project_dir))
+    if not metadata:
+        return None, {"passed": False, "issues": ["Project metadata not available."]}
+
+    chunks = metadata.get('chunks') or []
+    if chunk_number < 1 or chunk_number > len(chunks):
+        return None, {
+            "passed": False,
+            "issues": [
+                f"Chunk {chunk_number} is out of range for project '{project_name}'. "
+                f"Available chunks: {len(chunks)}"
+            ],
+        }
+
+    chunk_entry = chunks[chunk_number - 1]
+    character_name: Optional[str] = None
+    if isinstance(chunk_entry, dict):
+        chunk_text = chunk_entry.get('text', '')
+        character_name = chunk_entry.get('character')
+    else:
+        chunk_text = str(chunk_entry)
+
+    text_to_regenerate = custom_text.strip() if custom_text and custom_text.strip() else chunk_text.strip()
+    if not text_to_regenerate:
+        return None, {"passed": False, "issues": ["Selected chunk has no text to regenerate."]}
+
+    project_type = metadata.get('project_type', 'single_voice')
+    voice_info = metadata.get('voice_info', {})
+
+    if project_type == 'single_voice':
+        voice_name = voice_info.get('voice_name')
+        audio_prompt_path = voice_info.get('audio_prompt_path')
+        voice_config = dict(voice_info)
+
+        if not audio_prompt_path or not os.path.exists(audio_prompt_path):
+            prompt_path, reloaded_config = load_voice_for_tts(voice_library_path, voice_name or '')
+            if not prompt_path:
+                return None, {
+                    "passed": False,
+                    "issues": [
+                        f"Voice '{voice_name}' could not be loaded from the voice library for regeneration."
+                    ],
+                }
+            voice_config.update(reloaded_config)
+            voice_config['audio_prompt_path'] = prompt_path
+        else:
+            voice_config['audio_prompt_path'] = audio_prompt_path
+        voice_display = voice_config.get('display_name', voice_name or 'Unknown voice')
+    elif project_type == 'multi_voice':
+        voice_assignments = voice_info.get('voice_assignments', {})
+        if not character_name:
+            return None, {
+                "passed": False,
+                "issues": ["Character information missing for multi-voice chunk."],
+            }
+        assigned_voice = voice_assignments.get(character_name)
+        if not assigned_voice:
+            return None, {
+                "passed": False,
+                "issues": [f"No voice assignment found for character '{character_name}'."],
+            }
+        prompt_path, reloaded_config = load_voice_for_tts(voice_library_path, assigned_voice)
+        if not prompt_path:
+            return None, {
+                "passed": False,
+                "issues": [
+                    f"Voice '{assigned_voice}' could not be loaded for character '{character_name}'."
+                ],
+            }
+        voice_config = {**reloaded_config, 'voice_name': assigned_voice, 'audio_prompt_path': prompt_path}
+        voice_display = voice_config.get('display_name', assigned_voice)
+    else:
+        return None, {
+            "passed": False,
+            "issues": [f"Unsupported project type '{project_type}' for regeneration."],
+        }
+
+    if model is None:
+        model = load_model_cpu()
+
+    generation_attempts = max(1, retry_settings.get('generation_max_attempts', 3))
+    validation_attempts = max(1, retry_settings.get('validation_max_attempts', 1))
+    cooldown_seconds = max(0.0, retry_settings.get('cooldown_seconds', 0.0))
+
+    sample_rate = getattr(model, 'sr', 24000)
+    last_result: Dict[str, Any] = {"passed": False, "issues": ["Validation did not run."]}
+
+    for attempt in range(1, validation_attempts + 1):
+        try:
+            wav, device_used = generate_with_retry(
+                model,
+                text_to_regenerate,
+                voice_config['audio_prompt_path'],
+                voice_config.get('exaggeration', 1.0),
+                voice_config.get('temperature', 0.7),
+                voice_config.get('cfg_weight', 1.0),
+                max_retries=generation_attempts,
+            )
+        except Exception as generation_error:
+            last_result = {
+                "passed": False,
+                "issues": [f"Generation failed: {generation_error}"],
+                "attempt": attempt,
+                "voice": voice_display,
+                "character": character_name,
+            }
+            if attempt < validation_attempts and cooldown_seconds:
+                time.sleep(cooldown_seconds)
+            continue
+
+        audio_array = _audio_tensor_to_numpy(wav)
+        temp_filename = f"temp_regenerated_chunk_{chunk_number}_{int(time.time())}_{attempt}.wav"
+        temp_path = project_dir / temp_filename
+        _write_temp_wav(temp_path, audio_array, sample_rate)
+
+        validation_result = validate_audio_file(temp_path, qa_config)
+        validation_result.update({
+            "attempt": attempt,
+            "voice": voice_display,
+            "character": character_name,
+            "device_used": device_used,
+            "temp_file": str(temp_path),
+            "retry_settings": retry_settings,
+        })
+
+        if validation_result.get('passed', False):
+            return str(temp_path), validation_result
+
+        temp_path.unlink(missing_ok=True)
+        last_result = validation_result
+
+        if attempt < validation_attempts and cooldown_seconds:
+            time.sleep(cooldown_seconds)
+
+    last_result.setdefault('issues', []).append('Validation attempts exhausted without success.')
+    last_result['attempts_exhausted'] = True
+    return None, last_result
