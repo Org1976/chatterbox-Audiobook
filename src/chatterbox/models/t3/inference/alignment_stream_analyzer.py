@@ -39,7 +39,12 @@ class AlignmentStreamAnalyzer:
         # self.queue = queue
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
-        self.alignment = torch.zeros(0, j-i)
+        # Keep alignment buffer on the same device as the transformer to avoid device syncs/transfers
+        try:
+            self._device = next(tfmr.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cpu")
+        self.alignment = torch.zeros(0, j - i, device=self._device)
         # self.alignment_bin = torch.zeros(0, j-i)
         self.curr_frame_pos = 0
         self.text_position = 0
@@ -152,3 +157,4 @@ class AlignmentStreamAnalyzer:
 
         self.curr_frame_pos += 1
         return logits
+
