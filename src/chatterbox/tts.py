@@ -226,7 +226,7 @@ class ChatterboxTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
-        max_sampling_retries: int = 3,
+        max_sampling_retries: int = 5,
     ):
         # Update exaggeration if needed
         if exaggeration != conds.t3.emotion_adv[0, 0, 0]:
@@ -252,38 +252,9 @@ class ChatterboxTTS:
         BASE_MAX_NEW_TOKENS = 800
         eos_token_id = self.t3.hp.stop_speech_token
 
-        last_warning = False
+        # Single pass: up to max_sampling_retries attempts with the original parameters
         for attempt in range(max(1, int(max_sampling_retries))):
-            # Adjust parameters per attempt (backoff schedule)
-            if attempt == 0:
-                max_new = BASE_MAX_NEW_TOKENS
-                temp = float(temperature)
-                rep = float(repetition_penalty)
-                tp = float(top_p)
-                mp = float(min_p)
-                cfgw = float(cfg_weight)
-                eos_bias_start = None
-                eos_bias_val = 0.0
-            elif attempt == 1:
-                max_new = BASE_MAX_NEW_TOKENS + 100
-                temp = max(0.6, float(temperature) - 0.1)
-                rep = float(repetition_penalty) + 0.1
-                tp = min(float(top_p), 0.95)
-                mp = max(float(min_p), 0.07)
-                cfgw = max(0.0, float(cfg_weight) - 0.1)
-                eos_bias_start = int(0.7 * max_new)
-                eos_bias_val = 0.5
-            else:
-                max_new = BASE_MAX_NEW_TOKENS + 200
-                temp = max(0.55, float(temperature) - 0.2)
-                rep = float(repetition_penalty) + 0.2
-                tp = min(float(top_p), 0.9)
-                mp = max(float(min_p), 0.1)
-                cfgw = max(0.0, float(cfg_weight) - 0.2)
-                eos_bias_start = int(0.6 * max_new)
-                eos_bias_val = 0.75
-
-            # Clear CUDA memory and reseed between attempts to diversify sampling
+            # Clear CUDA / reseed between attempts to diversify sampling
             if attempt > 0:
                 if self.device == "cuda" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -294,28 +265,26 @@ class ChatterboxTTS:
                     torch.cuda.manual_seed(seed_val)
                     torch.cuda.manual_seed_all(seed_val)
                 random.seed(seed_val)
+
             with torch.inference_mode():
                 sampled_tokens = self.t3.inference(
                     t3_cond=conds.t3,
                     text_tokens=text_tokens,
-                    max_new_tokens=max_new,
-                    temperature=temp,
-                    cfg_weight=cfgw,
-                    repetition_penalty=rep,
-                    min_p=mp,
-                    top_p=tp,
-                    eos_bias_start_step=eos_bias_start,
-                    eos_bias_value=eos_bias_val,
+                    max_new_tokens=BASE_MAX_NEW_TOKENS,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
                 )
                 raw_tokens = sampled_tokens[0]
 
-                hit_cap = (raw_tokens.numel() >= max_new) and (raw_tokens[-1].item() != eos_token_id)
+                hit_cap = (raw_tokens.numel() >= BASE_MAX_NEW_TOKENS) and (raw_tokens[-1].item() != eos_token_id)
                 if hit_cap and attempt < max_sampling_retries - 1:
-                    print(f"⚠️ Sampling hit {max_new} tokens without EOS (attempt {attempt + 1}/{max_sampling_retries}). Retrying with temp={temp:.2f}, rep={rep:.2f}, top_p={tp:.2f}, min_p={mp:.2f}, cfgw={cfgw:.2f}...")
+                    print(f"⚠️ Sampling hit {BASE_MAX_NEW_TOKENS} tokens without EOS (attempt {attempt + 1}/{max_sampling_retries}). Retrying...")
                     continue
                 if hit_cap and attempt == max_sampling_retries - 1:
-                    print(f"⚠️ Sampling reached {max_new} tokens without EOS after {max_sampling_retries} attempts. Proceeding with truncated tokens.")
-                    last_warning = True
+                    print(f"⚠️ Sampling reached {BASE_MAX_NEW_TOKENS} tokens without EOS after {max_sampling_retries} attempts. Proceeding with truncated tokens.")
 
                 # Post-processing on the accepted sample
                 speech_tokens = drop_invalid_tokens(raw_tokens)
