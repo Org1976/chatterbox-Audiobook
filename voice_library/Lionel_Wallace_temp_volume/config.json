@@ -1,0 +1,22 @@
+{
+  "display_name": "Lionel Wallace",
+  "description": "",
+  "audio_file": "reference.mp3",
+  "exaggeration": 0.5,
+  "cfg_weight": 0.3,
+  "temperature": 0.8,
+  "created_date": "1761330960.710513",
+  "normalization_enabled": true,
+  "target_level_db": -18,
+  "normalization_applied": true,
+  "original_level_info": {
+    "rms_db": -18.280728108208407,
+    "peak_db": -1.1449313625060866,
+    "lufs": -34.811018794930575,
+    "duration": 2541.96
+  },
+  "min_p": 0.05,
+  "top_p": 1.0,
+  "repetition_penalty": 1.2,
+  "version": "2.1"
+}

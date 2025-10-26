@@ -1,0 +1,22 @@
+{
+  "display_name": "Morgan Freeman",
+  "description": "",
+  "audio_file": "reference.mp3",
+  "exaggeration": 0.5,
+  "cfg_weight": 0.5,
+  "temperature": 1.1,
+  "created_date": "1760815981.9246504",
+  "normalization_enabled": true,
+  "target_level_db": -18,
+  "normalization_applied": true,
+  "original_level_info": {
+    "rms_db": -35.8514608909791,
+    "peak_db": -13.8978798501771,
+    "lufs": -52.50895266528853,
+    "duration": 10.449
+  },
+  "min_p": 0.05,
+  "top_p": 1,
+  "repetition_penalty": 1.2,
+  "version": "2.1"
+}

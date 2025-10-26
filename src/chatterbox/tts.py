@@ -5,6 +5,8 @@ import librosa
 import torch
 import perth
 import torch.nn.functional as F
+import time
+import random
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
@@ -224,6 +226,7 @@ class ChatterboxTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        max_sampling_retries: int = 3,
     ):
         # Update exaggeration if needed
         if exaggeration != conds.t3.emotion_adv[0, 0, 0]:
@@ -246,30 +249,86 @@ class ChatterboxTTS:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-        with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=1000,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
+        BASE_MAX_NEW_TOKENS = 800
+        eos_token_id = self.t3.hp.stop_speech_token
 
-            speech_tokens = drop_invalid_tokens(speech_tokens)
-            
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+        last_warning = False
+        for attempt in range(max(1, int(max_sampling_retries))):
+            # Adjust parameters per attempt (backoff schedule)
+            if attempt == 0:
+                max_new = BASE_MAX_NEW_TOKENS
+                temp = float(temperature)
+                rep = float(repetition_penalty)
+                tp = float(top_p)
+                mp = float(min_p)
+                cfgw = float(cfg_weight)
+                eos_bias_start = None
+                eos_bias_val = 0.0
+            elif attempt == 1:
+                max_new = BASE_MAX_NEW_TOKENS + 100
+                temp = max(0.6, float(temperature) - 0.1)
+                rep = float(repetition_penalty) + 0.1
+                tp = min(float(top_p), 0.95)
+                mp = max(float(min_p), 0.07)
+                cfgw = max(0.0, float(cfg_weight) - 0.1)
+                eos_bias_start = int(0.7 * max_new)
+                eos_bias_val = 0.5
+            else:
+                max_new = BASE_MAX_NEW_TOKENS + 200
+                temp = max(0.55, float(temperature) - 0.2)
+                rep = float(repetition_penalty) + 0.2
+                tp = min(float(top_p), 0.9)
+                mp = max(float(min_p), 0.1)
+                cfgw = max(0.0, float(cfg_weight) - 0.2)
+                eos_bias_start = int(0.6 * max_new)
+                eos_bias_val = 0.75
 
-            speech_tokens = speech_tokens.to(self.device)
+            # Clear CUDA memory and reseed between attempts to diversify sampling
+            if attempt > 0:
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                seed_val = int(time.time_ns() & 0x7FFFFFFF) + attempt
+                torch.manual_seed(seed_val)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed(seed_val)
+                    torch.cuda.manual_seed_all(seed_val)
+                random.seed(seed_val)
+            with torch.inference_mode():
+                sampled_tokens = self.t3.inference(
+                    t3_cond=conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=max_new,
+                    temperature=temp,
+                    cfg_weight=cfgw,
+                    repetition_penalty=rep,
+                    min_p=mp,
+                    top_p=tp,
+                    eos_bias_start_step=eos_bias_start,
+                    eos_bias_value=eos_bias_val,
+                )
+                raw_tokens = sampled_tokens[0]
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                hit_cap = (raw_tokens.numel() >= max_new) and (raw_tokens[-1].item() != eos_token_id)
+                if hit_cap and attempt < max_sampling_retries - 1:
+                    print(f"⚠️ Sampling hit {max_new} tokens without EOS (attempt {attempt + 1}/{max_sampling_retries}). Retrying with temp={temp:.2f}, rep={rep:.2f}, top_p={tp:.2f}, min_p={mp:.2f}, cfgw={cfgw:.2f}...")
+                    continue
+                if hit_cap and attempt == max_sampling_retries - 1:
+                    print(f"⚠️ Sampling reached {max_new} tokens without EOS after {max_sampling_retries} attempts. Proceeding with truncated tokens.")
+                    last_warning = True
+
+                # Post-processing on the accepted sample
+                speech_tokens = drop_invalid_tokens(raw_tokens)
+                speech_tokens = speech_tokens[speech_tokens < 6561]
+                speech_tokens = speech_tokens.to(self.device)
+
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+        # Fallback (should not be reached due to return inside loop)
+        raise RuntimeError("TTS sampling retry loop exited unexpectedly")

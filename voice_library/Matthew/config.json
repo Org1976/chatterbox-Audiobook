@@ -1,0 +1,22 @@
+{
+  "display_name": "Matthew Mcconaughey",
+  "description": "",
+  "audio_file": "reference.wav",
+  "exaggeration": 0.5,
+  "cfg_weight": 0.5,
+  "temperature": 1.1,
+  "created_date": "1760816733.3137167",
+  "normalization_enabled": true,
+  "target_level_db": -18,
+  "normalization_applied": true,
+  "original_level_info": {
+    "rms_db": -26.634802735661964,
+    "peak_db": -7.058785215273184,
+    "lufs": -45.032320885291995,
+    "duration": 85.81129166666666
+  },
+  "min_p": 0.05,
+  "top_p": 1,
+  "repetition_penalty": 1.2,
+  "version": "2.1"
+}

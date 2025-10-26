@@ -1,0 +1,22 @@
+{
+  "display_name": "Ian McKellen",
+  "description": "",
+  "audio_file": "reference.wav",
+  "exaggeration": 0.5,
+  "cfg_weight": 0.5,
+  "temperature": 0.6,
+  "created_date": "1761503915.6574602",
+  "normalization_enabled": true,
+  "target_level_db": -18,
+  "normalization_applied": true,
+  "original_level_info": {
+    "rms_db": -22.835373805769606,
+    "peak_db": -0.4456953090162074,
+    "lufs": -37.38818885121295,
+    "duration": 57.666375
+  },
+  "min_p": 0.05,
+  "top_p": 1.0,
+  "repetition_penalty": 1.2,
+  "version": "2.1"
+}

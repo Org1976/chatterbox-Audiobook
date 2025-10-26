@@ -227,6 +227,9 @@ class T3(nn.Module):
         top_p=1.0,
         cfg_weight=0,
         enable_alignment_analysis: bool = False,
+        # Optional EOS encouragement
+        eos_bias_start_step: Optional[int] = None,
+        eos_bias_value: float = 0.0,
     ):
         """
         Args:
@@ -348,6 +351,11 @@ class T3(nn.Module):
             # Apply temperature scaling.
             if temperature != 1.0:
                 logits = logits / temperature
+
+            # Optionally encourage EOS after a certain step by adding a positive bias to EOS logit
+            if eos_bias_start_step is not None and i >= int(eos_bias_start_step):
+                eos_idx = self.hp.stop_speech_token
+                logits[..., eos_idx] = logits[..., eos_idx] + float(eos_bias_value)
 
             # Apply repetition penalty and top‑p filtering.
             logits = repetition_penalty_processor(generated_ids, logits)
